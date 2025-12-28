@@ -883,7 +883,7 @@ class activities_view_t
                     int ws_x = pending_workspace_switch % workspace_cols;
                     int ws_y = pending_workspace_switch / workspace_cols;
                     wf::point_t target_ws = {ws_x, ws_y};
-                    output->wset()->request_workspace(target_ws);
+                    output->wset()->set_workspace(target_ws);
 
                     switching_workspace = false;
                     pending_workspace_switch = -1;
