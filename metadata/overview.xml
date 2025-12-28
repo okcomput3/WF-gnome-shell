@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <wayfire>
-    <plugin name="gnome-shell">
-        <_short>GNOME Shell</_short>
+    <plugin name="overview">
+        <_short>Wayfire Overview</_short>
         <_long>GNOME Shell-like desktop experience with top panel, Activities button, and window overview with rounded corners</_long>
         <category>Desktop</category>
         

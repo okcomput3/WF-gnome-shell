@@ -1,4 +1,4 @@
 install_data(
-    'gnome-shell.xml',
+    'overview.xml',
     install_dir: metadata_dir
 )
