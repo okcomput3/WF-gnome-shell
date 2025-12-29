@@ -1,5 +1,5 @@
 /**
- * Wayfire GNOME Shell Plugin
+ * Wayfire GNOME Shell Plugin (compact version)
  *  copyright andrew pliatsikas
  * A GNOME Shell-like experience for Wayfire:
  * - Top panel with Activities button, clock
@@ -14,12 +14,10 @@
 #include <cairo.h>
 #include <linux/input-event-codes.h>
 #include <pango/pangocairo.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <ctime>
-#include <functional>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <memory>
@@ -27,14 +25,12 @@
 #include <vector>
 #include <wayfire/core.hpp>
 #include <wayfire/geometry.hpp>
-#include <wayfire/img.hpp>
 #include <wayfire/nonstd/wlroots-full.hpp>
 #include <wayfire/opengl.hpp>
 #include <wayfire/option-wrapper.hpp>
 #include <wayfire/output.hpp>
 #include <wayfire/per-output-plugin.hpp>
 #include <wayfire/plugin.hpp>
-#include <wayfire/plugins/common/util.hpp>
 #include <wayfire/region.hpp>
 #include <wayfire/render-manager.hpp>
 #include <wayfire/scene-operations.hpp>
@@ -42,7 +38,6 @@
 #include <wayfire/scene.hpp>
 #include <wayfire/signal-definitions.hpp>
 #include <wayfire/toplevel-view.hpp>
-#include <wayfire/util/duration.hpp>
 #include <wayfire/view-transform.hpp>
 #include <wayfire/view.hpp>
 #include <wayfire/workspace-set.hpp>
@@ -54,506 +49,207 @@
 
 namespace wf {
 namespace overview {
-// ============================================================================
-// Utility
-// ============================================================================
-
-struct color_t {
-  float r, g, b, a;
-
-  static color_t from_hex(const std::string &hex) {
-    color_t c{0.2f, 0.2f, 0.2f, 0.9f};
-    if ((hex.length() >= 7) && (hex[0] == '#')) {
-      c.r = std::stoi(hex.substr(1, 2), nullptr, 16) / 255.0f;
-      c.g = std::stoi(hex.substr(3, 2), nullptr, 16) / 255.0f;
-      c.b = std::stoi(hex.substr(5, 2), nullptr, 16) / 255.0f;
-      if (hex.length() >= 9) {
-        c.a = std::stoi(hex.substr(7, 2), nullptr, 16) / 255.0f;
-      }
-    }
-
-    return c;
-  }
-};
-
-// ============================================================================
-// Bezier Curve
-// ============================================================================
-
-class BezierCurve {
- public:
-  BezierCurve() = default;
-
-  BezierCurve(float p1x, float p1y, float p2x, float p2y)
-      : m_p1{p1x, p1y}, m_p2{p2x, p2y} {}
-
-  float getYForX(float x) const {
-    if (x <= 0.0f) {
-      return 0.0f;
-    }
-
-    if (x >= 1.0f) {
-      return 1.0f;
-    }
-
-    float t = findTForX(x);
-    return computeY(t);
-  }
-
- private:
-  struct Point {
-    float x, y;
-  };
-
-  Point m_p1{0.0f, 0.0f};
-  Point m_p2{1.0f, 1.0f};
-
-  float computeX(float t) const {
-    float mt = 1.0f - t;
-    return 3.0f * mt * mt * t * m_p1.x + 3.0f * mt * t * t * m_p2.x + t * t * t;
-  }
-
-  float computeY(float t) const {
-    float mt = 1.0f - t;
-    return 3.0f * mt * mt * t * m_p1.y + 3.0f * mt * t * t * m_p2.y + t * t * t;
-  }
-
-  float findTForX(float x) const {
-    float t = x;
-    for (int i = 0; i < 8; i++) {
-      float currentX = computeX(t);
-      float dx = currentX - x;
-      if (std::abs(dx) < 0.0001f) {
-        break;
-      }
-
-      float mt = 1.0f - t;
-      float derivative = 3.0f * mt * mt * m_p1.x +
-                         6.0f * mt * t * (m_p2.x - m_p1.x) +
-                         3.0f * t * t * (1.0f - m_p2.x);
-
-      if (std::abs(derivative) < 0.0001f) {
-        break;
-      }
-
-      t -= dx / derivative;
-      t = std::clamp(t, 0.0f, 1.0f);
-    }
-
-    return t;
-  }
-};
-
-// ============================================================================
-// Animated Variable
-// ============================================================================
-
-template <typename T>
-class AnimatedVar {
- public:
-  AnimatedVar() = default;
-  explicit AnimatedVar(T initial)
-      : m_value(initial), m_start(initial), m_goal(initial) {}
-
-  void setConfig(BezierCurve *curve, float durationMs) {
-    m_curve = curve;
-    m_durationMs = durationMs;
-  }
-
-  void set(T goal, bool animate = true) {
-    if (!animate || (m_durationMs <= 0)) {
-      m_value = goal;
-      m_goal = goal;
-      m_start = goal;
-      m_animating = false;
-      return;
-    }
-
-    m_start = m_value;
-    m_goal = goal;
-    m_startTime = std::chrono::high_resolution_clock::now();
-    m_animating = true;
-  }
-
-  void warp(T value) {
-    m_value = value;
-    m_goal = value;
-    m_start = value;
-    m_animating = false;
-  }
-
-  bool tick() {
-    if (!m_animating) {
-      return false;
-    }
-
-    auto now = std::chrono::high_resolution_clock::now();
-    float elapsed =
-        std::chrono::duration_cast<std::chrono::milliseconds>(now - m_startTime)
-            .count();
-    float progress = std::clamp(elapsed / m_durationMs, 0.0f, 1.0f);
-
-    float eased = m_curve ? m_curve->getYForX(progress) : progress;
-    m_value = lerp(m_start, m_goal, eased);
-
-    if (progress >= 1.0f) {
-      m_value = m_goal;
-      m_animating = false;
-      return false;
-    }
-
-    return true;
-  }
-
-  T value() const { return m_value; }
-
-  T goal() const { return m_goal; }
-
-  bool isAnimating() const { return m_animating; }
-
- private:
-  T m_value{};
-  T m_start{};
-  T m_goal{};
-  BezierCurve *m_curve = nullptr;
-  float m_durationMs = 300.0f;
-  bool m_animating = false;
-  std::chrono::time_point<std::chrono::high_resolution_clock> m_startTime;
-
-  static float lerp(float a, float b, float t) { return a + (b - a) * t; }
-
-  static double lerp(double a, double b, float t) { return a + (b - a) * t; }
-
-  static int lerp(int a, int b, float t) {
-    return static_cast<int>(a + (b - a) * t);
-  }
-};
-
-// ============================================================================
-// Animated Geometry
-// ============================================================================
-
-struct AnimatedGeometry {
-  AnimatedVar<int> x{0};
-  AnimatedVar<int> y{0};
-  AnimatedVar<int> width{100};
-  AnimatedVar<int> height{100};
-
-  void setConfig(BezierCurve *curve, float durationMs) {
-    x.setConfig(curve, durationMs);
-    y.setConfig(curve, durationMs);
-    width.setConfig(curve, durationMs);
-    height.setConfig(curve, durationMs);
-  }
-
-  void setGoal(wf::geometry_t geo, bool animate = true) {
-    x.set(geo.x, animate);
-    y.set(geo.y, animate);
-    width.set(geo.width, animate);
-    height.set(geo.height, animate);
-  }
-
-  void warp(wf::geometry_t geo) {
-    x.warp(geo.x);
-    y.warp(geo.y);
-    width.warp(geo.width);
-    height.warp(geo.height);
-  }
-
-  bool tick() {
-    bool a = x.tick();
-    bool b = y.tick();
-    bool c = width.tick();
-    bool d = height.tick();
-    return a || b || c || d;
-  }
-
-  wf::geometry_t current() const {
-    return {x.value(), y.value(), width.value(), height.value()};
-  }
-
-  wf::geometry_t goal() const {
-    return {x.goal(), y.goal(), width.goal(), height.goal()};
-  }
-
-  bool isAnimating() const {
-    return x.isAnimating() || y.isAnimating() || width.isAnimating() ||
-           height.isAnimating();
-  }
-};
-
-// ============================================================================
-// Window Slot for tracking views in overview
-// ============================================================================
 
 static const std::string TRANSFORMER_NAME = "wayfire-overview";
 
+// ============================================================================
+// Simple Animation Helper
+// ============================================================================
+
+class anim_t {
+  float val, start, goal, duration_ms;
+  std::chrono::steady_clock::time_point start_time;
+  bool animating = false;
+
+public:
+  anim_t(float v = 0) : val(v), start(v), goal(v), duration_ms(300) {}
+  
+  void set_duration(float ms) { duration_ms = ms; }
+  
+  void animate_to(float g) {
+    start = val; goal = g;
+    start_time = std::chrono::steady_clock::now();
+    animating = true;
+  }
+  
+  void warp(float v) { val = start = goal = v; animating = false; }
+  
+  bool tick() {
+    if (!animating) return false;
+    auto now = std::chrono::steady_clock::now();
+    float elapsed = std::chrono::duration<float, std::milli>(now - start_time).count();
+    float t = std::clamp(elapsed / duration_ms, 0.0f, 1.0f);
+    // Ease-out cubic
+    float ease = 1.0f - std::pow(1.0f - t, 3.0f);
+    val = start + (goal - start) * ease;
+    if (t >= 1.0f) { val = goal; animating = false; }
+    return animating;
+  }
+  
+  float value() const { return val; }
+  bool is_animating() const { return animating; }
+};
+
+struct anim_geo_t {
+  anim_t x, y, w, h;
+  
+  void set_duration(float ms) { x.set_duration(ms); y.set_duration(ms); w.set_duration(ms); h.set_duration(ms); }
+  void animate_to(wf::geometry_t g) { x.animate_to(g.x); y.animate_to(g.y); w.animate_to(g.width); h.animate_to(g.height); }
+  void warp(wf::geometry_t g) { x.warp(g.x); y.warp(g.y); w.warp(g.width); h.warp(g.height); }
+  bool tick() { bool a = x.tick(), b = y.tick(), c = w.tick(), d = h.tick(); return a || b || c || d; }
+  wf::geometry_t current() const { return {(int)x.value(), (int)y.value(), (int)w.value(), (int)h.value()}; }
+  bool is_animating() const { return x.is_animating() || y.is_animating() || w.is_animating() || h.is_animating(); }
+};
+
+// ============================================================================
+// Window Slot
+// ============================================================================
+
 struct window_slot_t {
   wayfire_toplevel_view view;
-  wf::geometry_t original_geometry;
-  wf::geometry_t target_geometry;
-  AnimatedGeometry animated_geometry;
+  wf::geometry_t orig_geo, target_geo;
+  anim_geo_t anim;
   std::shared_ptr<wf::scene::view_2d_transformer_t> transformer;
-  bool is_hovered = false;
+  bool hovered = false;
 
-  void setConfig(BezierCurve *curve, float durationMs) {
-    animated_geometry.setConfig(curve, durationMs);
+  void start_anim(bool entering, float duration) {
+    anim.set_duration(duration);
+    if (entering) { anim.warp(orig_geo); anim.animate_to(target_geo); }
+    else { anim.animate_to(orig_geo); }
   }
 
-  void startAnimation(bool entering_overview) {
-    if (entering_overview) {
-      animated_geometry.warp(original_geometry);
-      animated_geometry.setGoal(target_geometry, true);
-    } else {
-      animated_geometry.setGoal(original_geometry, true);
-    }
+  void update_transformer() {
+    if (!transformer || !view || !view->is_mapped() || orig_geo.width <= 0 || orig_geo.height <= 0) return;
+    auto cur = anim.current();
+    float sx = std::clamp((float)cur.width / orig_geo.width, 0.1f, 10.0f);
+    float sy = std::clamp((float)cur.height / orig_geo.height, 0.1f, 10.0f);
+    transformer->translation_x = (cur.x + cur.width/2.0f) - (orig_geo.x + orig_geo.width/2.0f);
+    transformer->translation_y = (cur.y + cur.height/2.0f) - (orig_geo.y + orig_geo.height/2.0f);
+    transformer->scale_x = sx; transformer->scale_y = sy;
+    transformer->alpha = hovered ? 1.0f : 0.92f;
   }
 
-  bool tick() { return animated_geometry.tick(); }
-
-  wf::geometry_t currentGeometry() const { return animated_geometry.current(); }
-
-  bool isAnimating() const { return animated_geometry.isAnimating(); }
-
-  void updateTransformer() {
-    if (!transformer || !view || !view->is_mapped()) {
-      return;
-    }
-
-    wf::geometry_t current = currentGeometry();
-    wf::geometry_t original = original_geometry;
-
-    if ((original.width <= 0) || (original.height <= 0)) {
-      return;
-    }
-
-    float scaleX = static_cast<float>(current.width) / original.width;
-    float scaleY = static_cast<float>(current.height) / original.height;
-
-    scaleX = std::clamp(scaleX, 0.1f, 10.0f);
-    scaleY = std::clamp(scaleY, 0.1f, 10.0f);
-
-    float originalCenterX = original.x + original.width / 2.0f;
-    float originalCenterY = original.y + original.height / 2.0f;
-    float currentCenterX = current.x + current.width / 2.0f;
-    float currentCenterY = current.y + current.height / 2.0f;
-
-    float offsetX = currentCenterX - originalCenterX;
-    float offsetY = currentCenterY - originalCenterY;
-
-    transformer->translation_x = offsetX;
-    transformer->translation_y = offsetY;
-    transformer->scale_x = scaleX;
-    transformer->scale_y = scaleY;
-    transformer->alpha = is_hovered ? 1.0f : 0.92f;
-  }
-
-  void resetTransformer() {
-    if (!transformer) {
-      return;
-    }
-
-    transformer->translation_x = 0;
-    transformer->translation_y = 0;
-    transformer->scale_x = 1.0f;
-    transformer->scale_y = 1.0f;
-    transformer->alpha = 1.0f;
+  void reset_transformer() {
+    if (!transformer) return;
+    transformer->translation_x = transformer->translation_y = 0;
+    transformer->scale_x = transformer->scale_y = transformer->alpha = 1.0f;
   }
 };
 
 // ============================================================================
-// Top Panel - Fixed version
+// Top Panel
 // ============================================================================
 
 class top_panel_t {
- public:
+public:
   wf::output_t *output;
   cairo_surface_t *surface = nullptr;
   cairo_t *cr = nullptr;
-  GLuint texture_id = 0;
-
-  int panel_width = 0;
-  int panel_height = 16;
-  wf::geometry_t activities_bounds;
-  wf::geometry_t clock_bounds;  // NEW: track clock region for targeted damage
+  GLuint tex_id = 0;
+  int width = 0, height = 16;
+  wf::geometry_t activities_bounds{};
   bool activities_hovered = false;
-  std::string panel_color = "#1a1a1aE6";
-  bool needs_redraw = true;  // NEW: dirty flag
+  std::string color = "#1a1a1aE6";
 
-  top_panel_t(wf::output_t *output, int height, const std::string &color)
-      : output(output), panel_height(height), panel_color(color) {
-    create_surface();
-  }
+  top_panel_t(wf::output_t *out, int h, const std::string &c) : output(out), height(h), color(c) { create(); }
+  ~top_panel_t() { destroy(); }
 
-  ~top_panel_t() { destroy_surface(); }
-
-  void create_surface() {
-    auto og = output->get_layout_geometry();
-    panel_width = og.width;
-
-    surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, panel_width,
-                                         panel_height);
+  void create() {
+    width = output->get_layout_geometry().width;
+    surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
     cr = cairo_create(surface);
-    render_panel();
-    upload_texture();
-    needs_redraw = false;
+    render(); upload();
   }
 
-  void destroy_surface() {
-    if (texture_id) {
-      wf::gles::run_in_context([&] { glDeleteTextures(1, &texture_id); });
-      texture_id = 0;
-    }
-
-    if (cr) {
-      cairo_destroy(cr);
-      cr = nullptr;
-    }
-
-    if (surface) {
-      cairo_surface_destroy(surface);
-      surface = nullptr;
-    }
+  void destroy() {
+    if (tex_id) { wf::gles::run_in_context([&] { glDeleteTextures(1, &tex_id); }); tex_id = 0; }
+    if (cr) { cairo_destroy(cr); cr = nullptr; }
+    if (surface) { cairo_surface_destroy(surface); surface = nullptr; }
   }
 
-  void render_panel() {
-    if (!cr) {
-      return;
+  void render() {
+    if (!cr) return;
+    // Parse color
+    float r = 0.1f, g = 0.1f, b = 0.1f, a = 0.9f;
+    if (color.length() >= 7 && color[0] == '#') {
+      r = std::stoi(color.substr(1,2), nullptr, 16) / 255.0f;
+      g = std::stoi(color.substr(3,2), nullptr, 16) / 255.0f;
+      b = std::stoi(color.substr(5,2), nullptr, 16) / 255.0f;
+      if (color.length() >= 9) a = std::stoi(color.substr(7,2), nullptr, 16) / 255.0f;
     }
-
-    auto color = color_t::from_hex(panel_color);
     cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-    cairo_set_source_rgba(cr, color.r, color.g, color.b, color.a);
+    cairo_set_source_rgba(cr, r, g, b, a);
     cairo_paint(cr);
 
     PangoLayout *layout = pango_cairo_create_layout(cr);
-    int font_size = panel_height >= 24 ? 11 : 8;
-    char font_str[64];
-    snprintf(font_str, sizeof(font_str), "Sans Bold %d", font_size);
-    PangoFontDescription *font = pango_font_description_from_string(font_str);
-    pango_layout_set_font_description(layout, font);
+    int fs = height >= 24 ? 11 : 8;
+    char font[32]; snprintf(font, sizeof(font), "Sans Bold %d", fs);
+    PangoFontDescription *fd = pango_font_description_from_string(font);
+    pango_layout_set_font_description(layout, fd);
 
+    // Activities
     pango_layout_set_text(layout, "Activities", -1);
-    int text_width, text_height;
-    pango_layout_get_pixel_size(layout, &text_width, &text_height);
-
-    int activities_x = 8;
-    int activities_y = (panel_height - text_height) / 2;
-
-    activities_bounds = {activities_x - 4, 0, text_width + 8, panel_height};
-
+    int tw, th; pango_layout_get_pixel_size(layout, &tw, &th);
+    int ax = 8, ay = (height - th) / 2;
+    activities_bounds = {ax - 4, 0, tw + 8, height};
     if (activities_hovered) {
-      cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.15);
-      cairo_rectangle(cr, activities_bounds.x, activities_bounds.y,
-                      activities_bounds.width, activities_bounds.height);
+      cairo_set_source_rgba(cr, 1, 1, 1, 0.15);
+      cairo_rectangle(cr, activities_bounds.x, 0, activities_bounds.width, height);
       cairo_fill(cr);
     }
-
-    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-    cairo_move_to(cr, activities_x, activities_y);
+    cairo_set_source_rgba(cr, 1, 1, 1, 1);
+    cairo_move_to(cr, ax, ay);
     pango_cairo_show_layout(cr, layout);
 
     // Clock
     time_t now = time(nullptr);
-    struct tm *tm_info = localtime(&now);
-    char time_str[64];
-    strftime(time_str, sizeof(time_str), "%a %b %d  %H:%M", tm_info);
-
-    pango_layout_set_text(layout, time_str, -1);
-    pango_layout_get_pixel_size(layout, &text_width, &text_height);
-
-    int clock_x = (panel_width - text_width) / 2;
-    int clock_y = (panel_height - text_height) / 2;
-
-    // NEW: Store clock bounds for targeted damage
-    clock_bounds = {clock_x - 4, 0, text_width + 8, panel_height};
-
-    cairo_move_to(cr, clock_x, clock_y);
+    char ts[64]; strftime(ts, sizeof(ts), "%a %b %d  %H:%M", localtime(&now));
+    pango_layout_set_text(layout, ts, -1);
+    pango_layout_get_pixel_size(layout, &tw, &th);
+    cairo_move_to(cr, (width - tw) / 2, (height - th) / 2);
     pango_cairo_show_layout(cr, layout);
 
-    pango_font_description_free(font);
+    pango_font_description_free(fd);
     g_object_unref(layout);
     cairo_surface_flush(surface);
   }
 
-  void upload_texture() {
-    if (!surface) {
-      return;
-    }
-
+  void upload() {
+    if (!surface) return;
     unsigned char *data = cairo_image_surface_get_data(surface);
-
     wf::gles::run_in_context([&] {
-      if (texture_id == 0) {
-        GL_CALL(glGenTextures(1, &texture_id));
-      }
-
-      GL_CALL(glBindTexture(GL_TEXTURE_2D, texture_id));
-      GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
-      GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
-      GL_CALL(
-          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
-      GL_CALL(
-          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
-      GL_CALL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, panel_width, panel_height,
-                           0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data));
-      GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
+      if (!tex_id) glGenTextures(1, &tex_id);
+      glBindTexture(GL_TEXTURE_2D, tex_id);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
+      glBindTexture(GL_TEXTURE_2D, 0);
     });
-
-    needs_redraw = false;
   }
 
-  // NEW: Returns the panel geometry in output coordinates for damage
-  wf::geometry_t get_panel_geometry() const {
+  wf::geometry_t get_geometry() const {
     auto og = output->get_layout_geometry();
-    return {og.x, og.y + og.height - panel_height, panel_width, panel_height};
+    return {og.x, og.y, width, height};  // Top of screen
   }
-
-  // NEW: Returns activities button geometry in output coordinates
-  wf::geometry_t get_activities_geometry() const {
+  
+  // For GL rendering (Y is flipped)
+  wf::geometry_t get_render_geometry() const {
     auto og = output->get_layout_geometry();
-    return {og.x + activities_bounds.x, og.y + activities_bounds.y,
-            activities_bounds.width, activities_bounds.height};
+    return {og.x, og.y + og.height - height, width, height};
   }
 
-  // NEW: Returns clock geometry in output coordinates
-  wf::geometry_t get_clock_geometry() const {
-    auto og = output->get_layout_geometry();
-    return {og.x + clock_bounds.x, og.y + clock_bounds.y, clock_bounds.width,
-            clock_bounds.height};
-  }
-
-  // CHANGED: Returns true if state changed (for caller to know if damage
-  // needed)
-  bool set_hover(bool hover) {
-    if (activities_hovered != hover) {
-      activities_hovered = hover;
-      render_panel();
-      upload_texture();
-      return true;  // State changed
-    }
-    return false;  // No change
-  }
-
-  // NEW: Update clock only, returns true if actually changed
-  bool update_clock() {
-    // Could optimize further by checking if minute changed
-    render_panel();
-    upload_texture();
+  bool set_hover(bool h) {
+    if (activities_hovered == h) return false;
+    activities_hovered = h; render(); upload();
     return true;
   }
 
-  bool point_in_activities(wf::pointf_t point) const {
+  bool point_in_activities(wf::pointf_t p) const {
     auto og = output->get_layout_geometry();
-    int local_x = point.x - og.x;
-    int local_y = point.y - og.y;
-    return local_x >= activities_bounds.x &&
-           local_x < activities_bounds.x + activities_bounds.width &&
-           local_y >= activities_bounds.y &&
-           local_y < activities_bounds.y + activities_bounds.height;
+    int lx = p.x - og.x, ly = p.y - og.y;
+    return lx >= activities_bounds.x && lx < activities_bounds.x + activities_bounds.width &&
+           ly >= 0 && ly < height;
   }
-
-  GLuint get_texture() const { return texture_id; }
 };
 
 // ============================================================================
@@ -561,1347 +257,604 @@ class top_panel_t {
 // ============================================================================
 
 class activities_view_t {
- public:
+public:
   wf::output_t *output;
-  std::vector<window_slot_t> window_slots;
+  std::vector<window_slot_t> slots;
   wayfire_toplevel_view hovered_view = nullptr;
-  wf::geometry_t screen_preview_geometry = {0, 0, 0,
-                                            0};  // Large main desktop preview
+  wf::geometry_t preview_geo{};
+  anim_geo_t desktop_anim;
+  std::vector<wf::geometry_t> ws_geos;
+  int ws_rows = 1, ws_cols = 1;
+  wf::point_t cur_ws{0, 0};
+  bool switching_ws = false;
+  int pending_ws = -1;
+  bool is_active = false, is_animating = false, transformers_attached = false;
+  int corner_radius = 12, spacing = 20, panel_height = 16, anim_duration = 300;
 
-  BezierCurve bezier_curve{0.25f, 0.1f, 0.25f, 1.0f};
-  AnimatedVar<float> background_alpha{0.0f};
+  activities_view_t(wf::output_t *out) : output(out) { desktop_anim.set_duration(anim_duration); }
+  ~activities_view_t() { cleanup(); }
 
-  // Animated desktop preview geometry - starts fullscreen, shrinks to preview
-  AnimatedGeometry desktop_preview_anim;
-
-  // Workspace grid info
-  int workspace_rows = 1;
-  int workspace_cols = 1;
-  wf::point_t current_workspace = {0, 0};
-  std::vector<wf::geometry_t>
-      workspace_preview_geometries;  // Small thumbnails at top
-
-  // For switching to a different workspace
-  bool switching_workspace = false;
-  int pending_workspace_switch = -1;
-
-  bool is_active = false;
-  bool is_animating = false;
-  bool transformers_attached = false;
-
-  int corner_radius = 12;
-  double overview_scale = 0.85;
-  int spacing = 20;
-  int panel_height = 16;
-  int animation_duration = 300;
-
-  activities_view_t(wf::output_t *output) : output(output) {
-    background_alpha.setConfig(&bezier_curve, animation_duration);
-    desktop_preview_anim.setConfig(&bezier_curve, animation_duration);
+  void set_config(int cr, int sp, int ph, int ad) {
+    corner_radius = cr; spacing = sp; panel_height = ph; anim_duration = ad;
+    desktop_anim.set_duration(ad);
   }
 
-  ~activities_view_t() { cleanup_transformers(); }
-
-  wf::geometry_t get_screen_preview_geometry_output() const {
-    auto og = output->get_layout_geometry();
-    return {og.x + screen_preview_geometry.x, og.y + screen_preview_geometry.y,
-            screen_preview_geometry.width, screen_preview_geometry.height};
-  }
-
-  void set_config(int radius, double scale, int space, int panel_h,
-                  int anim_duration) {
-    corner_radius = radius;
-    overview_scale = scale;
-    spacing = space;
-    panel_height = panel_h;
-    animation_duration = anim_duration;
-    background_alpha.setConfig(&bezier_curve, animation_duration);
-    desktop_preview_anim.setConfig(&bezier_curve, animation_duration);
-  }
-
-  bool toggle() {
-    if (is_active) {
-      deactivate();
-    } else {
-      activate();
-    }
-
-    return true;
-  }
+  void toggle() { is_active ? deactivate() : activate(); }
 
   void activate() {
-    if (is_active) {
-      return;
-    }
-
-    is_active = true;
-    is_animating = true;
+    if (is_active) return;
+    is_active = is_animating = true;
     transformers_attached = false;
 
     auto wsize = output->wset()->get_workspace_grid_size();
-    workspace_cols = wsize.width;
-    workspace_rows = wsize.height;
-    current_workspace = output->wset()->get_current_workspace();
+    ws_cols = wsize.width; ws_rows = wsize.height;
+    cur_ws = output->wset()->get_current_workspace();
 
-    window_slots.clear();
-
-    auto views = output->wset()->get_views(wf::WSET_MAPPED_ONLY |
-                                           wf::WSET_CURRENT_WORKSPACE);
-    for (auto &view : views) {
-      auto toplevel = wf::toplevel_cast(view);
-      if (toplevel && (toplevel->get_output() == output) &&
-          !toplevel->minimized && toplevel->is_mapped()) {
-        window_slot_t slot;
-        slot.view = toplevel;
-        slot.original_geometry = toplevel->get_geometry();
-
-        if (slot.original_geometry.width <= 0) {
-          slot.original_geometry.width = 100;
-        }
-
-        if (slot.original_geometry.height <= 0) {
-          slot.original_geometry.height = 100;
-        }
-
-        window_slots.push_back(slot);
+    slots.clear();
+    for (auto &v : output->wset()->get_views(wf::WSET_MAPPED_ONLY | wf::WSET_CURRENT_WORKSPACE)) {
+      auto tv = wf::toplevel_cast(v);
+      if (tv && tv->get_output() == output && !tv->minimized && tv->is_mapped()) {
+        window_slot_t s; s.view = tv;
+        s.orig_geo = tv->get_geometry();
+        if (s.orig_geo.width <= 0) s.orig_geo.width = 100;
+        if (s.orig_geo.height <= 0) s.orig_geo.height = 100;
+        slots.push_back(s);
       }
     }
 
-    arrange_windows();
-    attach_transformers_and_start_animation();
+    arrange();
+    attach_transformers();
 
     auto og = output->get_layout_geometry();
-    wf::geometry_t fullscreen = {0, 0, og.width, og.height};
-    desktop_preview_anim.warp(fullscreen);
-    desktop_preview_anim.setGoal(screen_preview_geometry, true);
-
-    // REMOVED: output->render->damage_whole();
-    // REMOVED: output->render->schedule_redraw();
-    // Let the caller handle damage
-
-    LOGI("Overview activated with ", window_slots.size(), " windows");
+    desktop_anim.warp({0, 0, og.width, og.height});
+    desktop_anim.animate_to(preview_geo);
   }
 
   void deactivate() {
-    if (!is_active) {
-      return;
-    }
-
+    if (!is_active) return;
     is_animating = true;
-
-    for (auto &slot : window_slots) {
-      slot.startAnimation(false);
-    }
-
+    for (auto &s : slots) s.start_anim(false, anim_duration);
     auto og = output->get_layout_geometry();
-    wf::geometry_t fullscreen = {0, 0, og.width, og.height};
-    desktop_preview_anim.setGoal(fullscreen, true);
-
-    // REMOVED: output->render->damage_whole();
-    // REMOVED: output->render->schedule_redraw();
-    // Let the caller handle damage
+    desktop_anim.animate_to({0, 0, og.width, og.height});
   }
 
-  void deactivate_to_workspace(int ws_idx) {
-    if (!is_active) {
-      return;
-    }
-
-    pending_workspace_switch = ws_idx;
-
-    wf::geometry_t target_geo;
-    if ((ws_idx >= 0) && (ws_idx < (int)workspace_preview_geometries.size())) {
-      target_geo = workspace_preview_geometries[ws_idx];
-    } else {
-      target_geo = screen_preview_geometry;
-    }
-
-    desktop_preview_anim.warp(target_geo);
-
-    is_animating = true;
-    switching_workspace = true;
-
-    cleanup_transformers();
-
+  void deactivate_to_ws(int idx) {
+    if (!is_active) return;
+    pending_ws = idx; switching_ws = true;
+    if (idx >= 0 && idx < (int)ws_geos.size()) desktop_anim.warp(ws_geos[idx]);
+    cleanup();
     auto og = output->get_layout_geometry();
-    wf::geometry_t fullscreen = {0, 0, og.width, og.height};
-    desktop_preview_anim.setGoal(fullscreen, true);
-
-    // REMOVED: output->render->damage_whole();
-    // REMOVED: output->render->schedule_redraw();
+    desktop_anim.animate_to({0, 0, og.width, og.height});
+    is_animating = true;
   }
 
-  void cleanup_transformers() {
-    for (auto &slot : window_slots) {
-      if (slot.view && slot.view->is_mapped() && slot.transformer) {
-        slot.resetTransformer();
-        slot.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME);
+  void cleanup() {
+    for (auto &s : slots) {
+      if (s.view && s.view->is_mapped() && s.transformer) {
+        s.reset_transformer();
+        s.view->get_transformed_node()->rem_transformer(TRANSFORMER_NAME);
       }
     }
-
-    window_slots.clear();
-    transformers_attached = false;
+    slots.clear(); transformers_attached = false;
   }
 
-  void attach_transformers_and_start_animation() {
-    if (transformers_attached) {
-      return;
+  void attach_transformers() {
+    if (transformers_attached) return;
+    for (auto &s : slots) {
+      if (!s.view || !s.view->is_mapped()) continue;
+      s.transformer = std::make_shared<wf::scene::view_2d_transformer_t>(s.view);
+      s.view->get_transformed_node()->add_transformer(s.transformer, wf::TRANSFORMER_2D, TRANSFORMER_NAME);
+      s.start_anim(true, anim_duration);
     }
-
-    for (auto &slot : window_slots) {
-      if (!slot.view || !slot.view->is_mapped()) {
-        continue;
-      }
-
-      auto transformer =
-          std::make_shared<wf::scene::view_2d_transformer_t>(slot.view);
-      slot.transformer = transformer;
-
-      slot.view->get_transformed_node()->add_transformer(
-          transformer, wf::TRANSFORMER_2D, TRANSFORMER_NAME);
-
-      slot.setConfig(&bezier_curve, animation_duration);
-      slot.startAnimation(true);
-    }
-
     transformers_attached = true;
-    background_alpha.warp(1.0f);  // No fade, instant
-
-    LOGI("Transformers attached, animation started");
   }
 
-  void check_animation_done() {
-    if (!is_animating) {
-      return;
+  void tick() {
+    desktop_anim.tick();
+    for (auto &s : slots) {
+      s.anim.tick(); s.update_transformer();
+      if (s.view && s.view->is_mapped()) s.view->damage();
     }
-
-    bool any_animating = desktop_preview_anim.isAnimating();
-    for (auto &slot : window_slots) {
-      if (slot.isAnimating()) {
-        any_animating = true;
-        break;
-      }
-    }
-
-    if (!any_animating) {
-      is_animating = false;
-
-      // Check if we're closing (desktop is back to full size)
-      auto og = output->get_layout_geometry();
-      auto current = desktop_preview_anim.current();
-      if (current.width >= og.width - 10)  // Close to fullscreen means closing
-      {
-        // If we were switching workspaces, do it now
-        if (switching_workspace && (pending_workspace_switch >= 0)) {
-          int ws_x = pending_workspace_switch % workspace_cols;
-          int ws_y = pending_workspace_switch / workspace_cols;
-          wf::point_t target_ws = {ws_x, ws_y};
-          output->wset()->set_workspace(target_ws);
-
-          switching_workspace = false;
-          pending_workspace_switch = -1;
-        }
-
-        cleanup_transformers();
-        is_active = false;
-        background_alpha.warp(0.0f);  // Turn off background
-        LOGI("Overview deactivated");
-      }
-    }
+    check_done();
   }
 
-  void arrange_windows() {
+  void check_done() {
+    if (!is_animating) return;
+    bool any = desktop_anim.is_animating();
+    for (auto &s : slots) if (s.anim.is_animating()) { any = true; break; }
+    if (any) return;
+    
+    is_animating = false;
     auto og = output->get_layout_geometry();
-
-    // Small workspace thumbnails at BOTTOM (unchanged from original)
-    int total_workspaces = workspace_cols * workspace_rows;
-    int thumb_height = og.height * 0.12;  // Same as original
-    int thumb_width = thumb_height * ((float)og.width / og.height);
-    int ws_spacing = spacing / 2;
-    int total_ws_width =
-        total_workspaces * thumb_width + (total_workspaces - 1) * ws_spacing;
-    int ws_start_x = (og.width - total_ws_width) / 2;
-    int bottom_margin = spacing * 2;
-    int ws_y = og.height - bottom_margin - thumb_height;  // At bottom
-
-    // Store geometry for each small workspace thumbnail
-    workspace_preview_geometries.clear();
-    for (int i = 0; i < total_workspaces; i++) {
-      wf::geometry_t ws_geo = {ws_start_x + i * (thumb_width + ws_spacing),
-                               ws_y, thumb_width, thumb_height};
-      workspace_preview_geometries.push_back(ws_geo);
-    }
-
-    // Large main desktop preview ABOVE the small thumbnails
-    int top_margin = panel_height + spacing * 2;
-    int main_bottom = ws_y - spacing * 2;  // Stop above the thumbnails
-    int main_side_margin = spacing * 4;
-
-    int available_height = main_bottom - top_margin;
-    int available_width = og.width - main_side_margin * 2;
-
-    // Calculate size maintaining aspect ratio
-    float screen_aspect = (float)og.width / og.height;
-    int main_width = available_width;
-    int main_height = main_width / screen_aspect;
-
-    if (main_height > available_height) {
-      main_height = available_height;
-      main_width = main_height * screen_aspect;
-    }
-
-    // Scale down slightly for visual appeal
-    main_width *= 0.95;
-    main_height *= 0.95;
-
-    int main_x = (og.width - main_width) / 2;
-    int main_y = top_margin + (available_height - main_height) / 2;
-
-    // This is the large desktop preview geometry (above thumbnails)
-    screen_preview_geometry = {main_x, main_y, main_width, main_height};
-
-    if (window_slots.empty()) {
-      return;
-    }
-
-    // Arrange windows within the large desktop preview area
-    int win_available_width = main_width - spacing * 4;
-    int win_available_height = main_height - spacing * 4;
-
-    int count = window_slots.size();
-    int cols = std::ceil(std::sqrt(count * 1.5));
-    int rows = std::ceil((double)count / cols);
-
-    int cell_width = (win_available_width - spacing * (cols - 1)) / cols;
-    int cell_height = (win_available_height - spacing * (rows - 1)) / rows;
-
-    int grid_width = cols * cell_width + (cols - 1) * spacing;
-    int grid_height = rows * cell_height + (rows - 1) * spacing;
-    int grid_start_x = main_x + (main_width - grid_width) / 2;
-    int grid_start_y = main_y + (main_height - grid_height) / 2;
-
-    for (size_t i = 0; i < window_slots.size(); i++) {
-      auto &slot = window_slots[i];
-      int col = i % cols;
-      int row = i / cols;
-
-      int cell_x = grid_start_x + col * (cell_width + spacing);
-      int cell_y = grid_start_y + row * (cell_height + spacing);
-
-      auto &orig = slot.original_geometry;
-
-      double scale_x = (double)cell_width / orig.width;
-      double scale_y = (double)cell_height / orig.height;
-      double scale = std::min(scale_x, scale_y) * 0.85;
-
-      int scaled_w = orig.width * scale;
-      int scaled_h = orig.height * scale;
-
-      slot.target_geometry = {cell_x + (cell_width - scaled_w) / 2,
-                              cell_y + (cell_height - scaled_h) / 2, scaled_w,
-                              scaled_h};
-    }
-  }
-
-  void tick_animations() {
-    background_alpha.tick();
-    desktop_preview_anim.tick();
-
-    for (auto &slot : window_slots) {
-      slot.tick();
-      slot.updateTransformer();
-
-      if (slot.view && slot.view->is_mapped()) {
-        slot.view->damage();
+    auto cur = desktop_anim.current();
+    if (cur.width >= og.width - 10) {
+      if (switching_ws && pending_ws >= 0) {
+        output->wset()->set_workspace({pending_ws % ws_cols, pending_ws / ws_cols});
+        switching_ws = false; pending_ws = -1;
       }
+      cleanup(); is_active = false;
     }
-
-    check_animation_done();
-
-    // REMOVED: output->render->damage_whole();
-    // The pre_hook handles damage when needed
   }
 
-  // In activities_view_t class, replace find_view_at():
+  void arrange() {
+    auto og = output->get_layout_geometry();
+    int total_ws = ws_cols * ws_rows;
+    int th = og.height * 0.12, tw = th * og.width / og.height;
+    int ws_sp = spacing / 2;
+    int total_w = total_ws * tw + (total_ws - 1) * ws_sp;
+    int ws_x = (og.width - total_w) / 2;
+    int ws_y = og.height - spacing * 2 - th;
 
-  wayfire_toplevel_view find_view_at(wf::pointf_t point) {
-    // Point is in output-local coordinates (0,0 is top-left of output)
-    // Window slot geometries are also in output-local coordinates (from
-    // arrange_windows) So we can compare directly
+    ws_geos.clear();
+    for (int i = 0; i < total_ws; i++)
+      ws_geos.push_back({ws_x + i * (tw + ws_sp), ws_y, tw, th});
 
-    for (auto it = window_slots.rbegin(); it != window_slots.rend(); ++it) {
-      auto geom = it->currentGeometry();
-      if ((point.x >= geom.x) && (point.x < geom.x + geom.width) &&
-          (point.y >= geom.y) && (point.y < geom.y + geom.height)) {
+    int top = panel_height + spacing * 2;
+    int main_bot = ws_y - spacing * 2;
+    int avail_h = main_bot - top, avail_w = og.width - spacing * 8;
+    float aspect = (float)og.width / og.height;
+    int mw = avail_w, mh = mw / aspect;
+    if (mh > avail_h) { mh = avail_h; mw = mh * aspect; }
+    mw *= 0.95; mh *= 0.95;
+    int mx = (og.width - mw) / 2, my = top + (avail_h - mh) / 2;
+    preview_geo = {mx, my, mw, mh};
+
+    if (slots.empty()) return;
+    int waw = mw - spacing * 4, wah = mh - spacing * 4;
+    int cols = std::ceil(std::sqrt(slots.size() * 1.5));
+    int rows = std::ceil((double)slots.size() / cols);
+    int cw = (waw - spacing * (cols - 1)) / cols;
+    int ch = (wah - spacing * (rows - 1)) / rows;
+    int gw = cols * cw + (cols - 1) * spacing;
+    int gh = rows * ch + (rows - 1) * spacing;
+    int gx = mx + (mw - gw) / 2, gy = my + (mh - gh) / 2;
+
+    for (size_t i = 0; i < slots.size(); i++) {
+      auto &s = slots[i];
+      int col = i % cols, row = i / cols;
+      int cx = gx + col * (cw + spacing), cy = gy + row * (ch + spacing);
+      double sc = std::min((double)cw / s.orig_geo.width, (double)ch / s.orig_geo.height) * 0.85;
+      int sw = s.orig_geo.width * sc, sh = s.orig_geo.height * sc;
+      s.target_geo = {cx + (cw - sw) / 2, cy + (ch - sh) / 2, sw, sh};
+    }
+  }
+
+  wayfire_toplevel_view find_view_at(wf::pointf_t p) {
+    for (auto it = slots.rbegin(); it != slots.rend(); ++it) {
+      auto g = it->anim.current();
+      if (p.x >= g.x && p.x < g.x + g.width && p.y >= g.y && p.y < g.y + g.height)
         return it->view;
-      }
     }
-
     return nullptr;
   }
 
-  // Find which workspace thumbnail was clicked (-1 if none)
-  // Point is in output-local coordinates
-  int find_workspace_at(wf::pointf_t point) {
+  int find_ws_at(wf::pointf_t p) {
     auto og = output->get_layout_geometry();
-    // Convert to output-local coordinates
-    float local_x = point.x - og.x;
-    // Y is inverted in GL coordinates
-    float local_y = og.height - (point.y - og.y);
-
-    for (size_t i = 0; i < workspace_preview_geometries.size(); i++) {
-      auto &geo = workspace_preview_geometries[i];
-      if ((local_x >= geo.x) && (local_x < geo.x + geo.width) &&
-          (local_y >= geo.y) && (local_y < geo.y + geo.height)) {
-        return (int)i;
-      }
+    float lx = p.x - og.x, ly = og.height - (p.y - og.y);
+    for (size_t i = 0; i < ws_geos.size(); i++) {
+      auto &g = ws_geos[i];
+      if (lx >= g.x && lx < g.x + g.width && ly >= g.y && ly < g.y + g.height)
+        return i;
     }
-
     return -1;
   }
 
-  // Check if point is inside the large desktop preview
-  bool point_in_large_preview(wf::pointf_t point) {
+  bool handle_click(wf::pointf_t p) {
     auto og = output->get_layout_geometry();
-    float local_x = point.x - og.x;
-    float local_y = og.height - (point.y - og.y);
-
-    auto geo = desktop_preview_anim.current();
-    return local_x >= geo.x && local_x < geo.x + geo.width &&
-           local_y >= geo.y && local_y < geo.y + geo.height;
+    wf::pointf_t lp = {p.x - og.x, p.y - og.y};
+    if (auto v = find_view_at(lp)) { deactivate(); return true; }
+    int ws = find_ws_at(p);
+    if (ws >= 0 && ws < (int)ws_geos.size()) {
+      int cur = cur_ws.y * ws_cols + cur_ws.x;
+      if (ws != cur) deactivate_to_ws(ws); else deactivate();
+      return true;
+    }
+    deactivate(); return true;
   }
 
-  bool handle_click(wf::pointf_t point) {
+  void update_hover(wf::pointf_t p) {
+    auto nv = find_view_at(p);
+    if (nv != hovered_view) {
+      for (auto &s : slots) s.hovered = (s.view == nv);
+      hovered_view = nv;
+    }
+  }
+
+  wf::geometry_t get_preview_geo_output() const {
     auto og = output->get_layout_geometry();
-
-    // First check if clicked on a window (windows are in output-local coords)
-    wf::pointf_t local_point = {point.x - og.x, point.y - og.y};
-    auto view = find_view_at(local_point);
-    if (view) {
-      wf::view_bring_to_front(view);
-      deactivate();
-      return true;
-    }
-
-    // Check if clicked on the large desktop preview (deactivate/zoom back)
-    if (point_in_large_preview(point)) {
-      deactivate();
-      return true;
-    }
-
-    // Check if clicked on a workspace thumbnail
-    int ws_idx = find_workspace_at(point);
-    if ((ws_idx >= 0) && (ws_idx < (int)workspace_preview_geometries.size())) {
-      int current_idx = get_current_workspace_index();
-
-      if (ws_idx != current_idx) {
-        // Animate from the clicked workspace's thumbnail position
-        deactivate_to_workspace(ws_idx);
-      } else {
-        // Clicked on current workspace, just deactivate normally
-        deactivate();
-      }
-
-      return true;
-    }
-
-    deactivate();
-    return true;
+    return {og.x + preview_geo.x, og.y + preview_geo.y, preview_geo.width, preview_geo.height};
   }
 
-  void update_hover(wf::pointf_t point) {
-    auto new_hovered = find_view_at(point);
-
-    if (new_hovered != hovered_view) {
-      for (auto &slot : window_slots) {
-        slot.is_hovered = (slot.view == new_hovered);
-      }
-
-      hovered_view = new_hovered;
-    }
-  }
-
-  bool currently_animating() const { return is_animating; }
-
-  float get_background_alpha() const { return background_alpha.value(); }
-
-  wf::geometry_t get_screen_preview_geometry() const {
-    return screen_preview_geometry;
-  }
-
-  wf::geometry_t get_current_desktop_geometry() const {
-    return desktop_preview_anim.current();
-  }
-
-  const std::vector<wf::geometry_t> &get_workspace_geometries() const {
-    return workspace_preview_geometries;
-  }
-
-  int get_current_workspace_index() const {
-    return current_workspace.y * workspace_cols + current_workspace.x;
-  }
-
-  int get_total_workspaces() const { return workspace_cols * workspace_rows; }
-
-  // Returns the workspace index that should be drawn as the animating one
-  int get_animating_workspace_index() const {
-    if (switching_workspace && (pending_workspace_switch >= 0)) {
-      return pending_workspace_switch;
-    }
-
-    return current_workspace.y * workspace_cols + current_workspace.x;
+  int get_animating_ws() const {
+    if (switching_ws && pending_ws >= 0) return pending_ws;
+    return cur_ws.y * ws_cols + cur_ws.x;
   }
 };
 
 // ============================================================================
-// Overview Render Node - renders the overview background and preview
+// GL Render Helpers
 // ============================================================================
 
-class overview_render_node_t : public wf::scene::node_t {
- public:
+struct gl_programs_t {
+  OpenGL::program_t tex, rounded, col;
+  bool loaded = false;
+
+  void load() {
+    if (loaded) return;
+    loaded = true;
+    const char *tv = "#version 100\nattribute vec2 position; attribute vec2 uv; varying vec2 vuv; uniform mat4 matrix;\nvoid main() { gl_Position = matrix * vec4(position, 0.0, 1.0); vuv = uv; }\n";
+    const char *tf = "#version 100\nprecision mediump float; varying vec2 vuv; uniform sampler2D smp; uniform float alpha;\nvoid main() { vec4 c = texture2D(smp, vuv); gl_FragColor = vec4(c.rgb * alpha, c.a * alpha); }\n";
+    tex.compile(tv, tf);
+
+    const char *rv = "#version 100\nprecision mediump float; attribute vec2 position; attribute vec2 uv; varying vec2 vuv; varying vec2 fc; uniform mat4 matrix; uniform vec2 size;\nvoid main() { gl_Position = matrix * vec4(position, 0.0, 1.0); vuv = uv; fc = uv * size; }\n";
+    const char *rf = "#version 100\nprecision mediump float; varying vec2 vuv; varying vec2 fc; uniform sampler2D smp; uniform float alpha; uniform float radius; uniform vec2 size;\nvoid main() { vec4 c = texture2D(smp, vuv); vec2 cd; if (fc.x < radius && fc.y < radius) cd = fc - vec2(radius); else if (fc.x > size.x - radius && fc.y < radius) cd = fc - vec2(size.x - radius, radius); else if (fc.x < radius && fc.y > size.y - radius) cd = fc - vec2(radius, size.y - radius); else if (fc.x > size.x - radius && fc.y > size.y - radius) cd = fc - vec2(size.x - radius, size.y - radius); else { gl_FragColor = vec4(c.rgb * alpha, c.a * alpha); return; } float d = length(cd); float aa = smoothstep(radius, radius - 1.5, d); gl_FragColor = vec4(c.rgb * alpha * aa, c.a * alpha * aa); }\n";
+    rounded.compile(rv, rf);
+
+    const char *cv = "#version 100\nattribute vec2 position; uniform mat4 matrix;\nvoid main() { gl_Position = matrix * vec4(position, 0.0, 1.0); }\n";
+    const char *cf = "#version 100\nprecision mediump float; uniform vec4 color;\nvoid main() { gl_FragColor = color; }\n";
+    col.compile(cv, cf);
+  }
+
+  void free() { tex.free_resources(); rounded.free_resources(); col.free_resources(); }
+};
+
+inline void render_tex(OpenGL::program_t &prog, wf::output_t *out, GLuint tex, wf::geometry_t box, float alpha, bool flip_y) {
+  auto og = out->get_layout_geometry();
+  glm::mat4 ortho = glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
+  float v0 = flip_y ? 1.0f : 0.0f, v1 = flip_y ? 0.0f : 1.0f;
+  GLfloat verts[] = {(float)box.x, (float)box.y, (float)(box.x + box.width), (float)box.y, (float)(box.x + box.width), (float)(box.y + box.height), (float)box.x, (float)(box.y + box.height)};
+  GLfloat uvs[] = {0, v0, 1, v0, 1, v1, 0, v1};
+  prog.use(wf::TEXTURE_TYPE_RGBA);
+  prog.uniformMatrix4f("matrix", ortho);
+  prog.uniform1i("smp", 0); prog.uniform1f("alpha", alpha);
+  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex);
+  prog.attrib_pointer("position", 2, 0, verts);
+  prog.attrib_pointer("uv", 2, 0, uvs);
+  glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+  glDisable(GL_BLEND); glBindTexture(GL_TEXTURE_2D, 0);
+  prog.deactivate();
+}
+
+inline void render_rounded(OpenGL::program_t &prog, wf::output_t *out, GLuint tex, wf::geometry_t box, float alpha, float radius, bool flip_y) {
+  auto og = out->get_layout_geometry();
+  glm::mat4 ortho = glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
+  float v0 = flip_y ? 1.0f : 0.0f, v1 = flip_y ? 0.0f : 1.0f;
+  GLfloat verts[] = {(float)box.x, (float)box.y, (float)(box.x + box.width), (float)box.y, (float)(box.x + box.width), (float)(box.y + box.height), (float)box.x, (float)(box.y + box.height)};
+  GLfloat uvs[] = {0, v0, 1, v0, 1, v1, 0, v1};
+  prog.use(wf::TEXTURE_TYPE_RGBA);
+  prog.uniformMatrix4f("matrix", ortho);
+  prog.uniform1i("smp", 0); prog.uniform1f("alpha", alpha);
+  prog.uniform1f("radius", radius); prog.uniform2f("size", box.width, box.height);
+  glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, tex);
+  prog.attrib_pointer("position", 2, 0, verts);
+  prog.attrib_pointer("uv", 2, 0, uvs);
+  glEnable(GL_BLEND); glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+  glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+  glDisable(GL_BLEND); glBindTexture(GL_TEXTURE_2D, 0);
+  prog.deactivate();
+}
+
+inline void render_rect(OpenGL::program_t &prog, wf::output_t *out, wf::geometry_t box, glm::vec4 color) {
+  auto og = out->get_layout_geometry();
+  glm::mat4 ortho = glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
+  GLfloat verts[] = {(float)box.x, (float)box.y, (float)(box.x + box.width), (float)box.y, (float)(box.x + box.width), (float)(box.y + box.height), (float)box.x, (float)(box.y + box.height)};
+  prog.use(wf::TEXTURE_TYPE_RGBA);
+  prog.uniformMatrix4f("matrix", ortho);
+  prog.uniform4f("color", color);
+  prog.attrib_pointer("position", 2, 0, verts);
+  glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+  glDisable(GL_BLEND);
+  prog.deactivate();
+}
+
+// ============================================================================
+// Panel Render Node (for when overview is inactive)
+// ============================================================================
+
+class panel_node_t : public wf::scene::node_t {
+public:
+  wf::output_t *output;
+  top_panel_t *panel;
+  gl_programs_t *progs;
+  bool *overview_active;
+
+  class instance_t : public wf::scene::render_instance_t {
+    panel_node_t *self;
+  public:
+    instance_t(panel_node_t *s, wf::scene::damage_callback) : self(s) {}
+    
+    void schedule_instructions(std::vector<wf::scene::render_instruction_t> &instr, 
+                               const wf::render_target_t &target, wf::region_t &damage) override {
+      if (self->overview_active && *self->overview_active) return;  // Overview draws panel
+      auto bbox = self->get_bounding_box();
+      wf::region_t our_damage = damage & bbox;
+      if (!our_damage.empty()) {
+        instr.push_back({.instance = this, .target = target, .damage = our_damage});
+      }
+    }
+    
+    void render(const wf::scene::render_instruction_t &data) override {
+      data.pass->custom_gles_subpass([&] {
+        if (self->panel && self->panel->tex_id) {
+          render_tex(self->progs->tex, self->output, self->panel->tex_id, 
+                     self->panel->get_render_geometry(), 1.0f, true);
+        }
+      });
+    }
+    
+    void compute_visibility(wf::output_t*, wf::region_t&) override {}
+  };
+
+  panel_node_t(wf::output_t *out, top_panel_t *p, gl_programs_t *pr, bool *active)
+    : node_t(false), output(out), panel(p), progs(pr), overview_active(active) {}
+
+  void gen_render_instances(std::vector<wf::scene::render_instance_uptr> &i, 
+                            wf::scene::damage_callback pd, wf::output_t *on) override {
+    if (on != output) return;
+    i.push_back(std::make_unique<instance_t>(this, pd));
+  }
+
+  wf::geometry_t get_bounding_box() override { return panel->get_geometry(); }
+};
+
+// ============================================================================
+// Overview Render Node
+// ============================================================================
+
+class overview_node_t : public wf::scene::node_t {
+public:
   wf::output_t *output;
   activities_view_t *activities;
-  OpenGL::program_t *tex_program;
-  OpenGL::program_t *rounded_tex_program;
-  OpenGL::program_t *col_program;
-  GLuint wallpaper_texture;
-  top_panel_t *panel; 
+  gl_programs_t *progs;
+  GLuint wallpaper_tex;
+  top_panel_t *panel;
 
-  // Workspace capture data structure (public so render_overview can use it)
-  struct workspace_capture_t {
+  struct ws_capture_t {
     std::shared_ptr<wf::workspace_stream_node_t> stream;
     std::vector<wf::scene::render_instance_uptr> instances;
     wf::region_t damage;
-    wf::auxilliary_buffer_t framebuffer;
-    wf::point_t workspace;
+    wf::auxilliary_buffer_t fb;
+    wf::point_t ws;
   };
 
-  class overview_render_instance_t : public wf::scene::render_instance_t {
-    std::shared_ptr<overview_render_node_t> self;
+  class render_instance_t : public wf::scene::render_instance_t {
+    std::shared_ptr<overview_node_t> self;
     wf::scene::damage_callback push_damage;
+  public:
+    std::vector<ws_capture_t> captures;
 
-   public:
-    // Workspace streams for ALL workspaces
-    std::vector<workspace_capture_t> workspace_captures;
-
-   private:
-    wf::signal::connection_t<wf::scene::node_damage_signal> on_node_damage =
-        [=](wf::scene::node_damage_signal *ev) { push_damage(ev->region); };
-
-   public:
-    overview_render_instance_t(overview_render_node_t *self,
-                               wf::scene::damage_callback push_damage) {
-      this->self = std::dynamic_pointer_cast<overview_render_node_t>(
-          self->shared_from_this());
-      this->push_damage = push_damage;
-      self->connect(&on_node_damage);
-
-      // Create workspace streams for ALL workspaces
-      auto wsize = self->output->wset()->get_workspace_grid_size();
-
+    render_instance_t(overview_node_t *s, wf::scene::damage_callback pd) : push_damage(pd) {
+      self = std::dynamic_pointer_cast<overview_node_t>(s->shared_from_this());
+      auto wsize = s->output->wset()->get_workspace_grid_size();
       for (int y = 0; y < wsize.height; y++) {
         for (int x = 0; x < wsize.width; x++) {
-          wf::point_t ws = {x, y};
-          workspace_capture_t capture;
-          capture.workspace = ws;
-          capture.stream =
-              std::make_shared<wf::workspace_stream_node_t>(self->output, ws);
-
-          auto push_damage_child =
-              [this, self,
-               idx = workspace_captures.size()](const wf::region_t &damage) {
-                if (idx < workspace_captures.size()) {
-                  workspace_captures[idx].damage |= damage;
-                }
-
-                this->push_damage(self->get_bounding_box());
-              };
-
-          capture.stream->gen_render_instances(capture.instances,
-                                               push_damage_child, self->output);
-          capture.damage |= capture.stream->get_bounding_box();
-
-          workspace_captures.push_back(std::move(capture));
+          ws_capture_t c; c.ws = {x, y};
+          c.stream = std::make_shared<wf::workspace_stream_node_t>(s->output, c.ws);
+          auto idx = captures.size();
+          c.stream->gen_render_instances(c.instances, [this, idx](const wf::region_t &d) {
+            if (idx < captures.size()) captures[idx].damage |= d;
+            push_damage(self->get_bounding_box());
+          }, s->output);
+          c.damage |= c.stream->get_bounding_box();
+          captures.push_back(std::move(c));
         }
       }
     }
 
-void schedule_instructions(
-    std::vector<wf::scene::render_instruction_t>& instructions,
-    const wf::render_target_t& target, wf::region_t& damage) override
-{
-    auto bbox = self->get_bounding_box();
-    const float scale = self->output->handle->scale;
-
-    // Force full damage on workspace captures during animation
-    bool is_animating = self->activities->currently_animating();
-
-    // Render ALL workspaces to their framebuffers
-    for (auto &capture : workspace_captures) {
-      auto ws_bbox = capture.stream->get_bounding_box();
-      capture.framebuffer.allocate(wf::dimensions(ws_bbox), scale);
-
-      wf::render_target_t ws_target{capture.framebuffer};
-      ws_target.geometry = ws_bbox;
-      ws_target.scale = scale;
-
-      // If animating, force full redraw of workspace capture
-      wf::region_t ws_damage = is_animating ? ws_bbox : capture.damage;
-
-      wf::render_pass_params_t params;
-      params.instances = &capture.instances;
-      params.damage = ws_damage;
-      params.reference_output = self->output;
-      params.target = ws_target;
-      params.flags = wf::RPASS_CLEAR_BACKGROUND | wf::RPASS_EMIT_SIGNALS;
-
-      wf::render_pass_t::run(params);
-      capture.damage.clear();
-    }
-
-    // Schedule our render instruction
-    instructions.push_back(wf::scene::render_instruction_t{
-        .instance = this,
-        .target = target,
-        .damage = damage & bbox,
-    });
-
-    damage ^= bbox;
-}
-
-    void render(const wf::scene::render_instruction_t &data) override {
-      self->render_overview(data, workspace_captures);
-    }
-
-    void compute_visibility(wf::output_t *output, wf::region_t &) override {
-      for (auto &capture : workspace_captures) {
-        for (auto &ch : capture.instances) {
-          wf::region_t ws_region = capture.stream->get_bounding_box();
-          ch->compute_visibility(output, ws_region);
-        }
+    void schedule_instructions(std::vector<wf::scene::render_instruction_t> &instr, const wf::render_target_t &target, wf::region_t &damage) override {
+      auto bbox = self->get_bounding_box();
+      float scale = self->output->handle->scale;
+      bool anim = self->activities->is_animating;
+      for (auto &c : captures) {
+        auto ws_box = c.stream->get_bounding_box();
+        c.fb.allocate(wf::dimensions(ws_box), scale);
+        wf::render_target_t t{c.fb}; t.geometry = ws_box; t.scale = scale;
+        wf::render_pass_params_t p;
+        p.instances = &c.instances;
+        p.damage = anim ? wf::region_t{ws_box} : c.damage;
+        p.reference_output = self->output; p.target = t;
+        p.flags = wf::RPASS_CLEAR_BACKGROUND | wf::RPASS_EMIT_SIGNALS;
+        wf::render_pass_t::run(p);
+        c.damage.clear();
       }
+      instr.push_back({.instance = this, .target = target, .damage = damage & bbox});
+      damage ^= bbox;
+    }
+
+    void render(const wf::scene::render_instruction_t &data) override { self->do_render(data, captures); }
+    void compute_visibility(wf::output_t *out, wf::region_t &) override {
+      for (auto &c : captures) for (auto &i : c.instances) { wf::region_t r = c.stream->get_bounding_box(); i->compute_visibility(out, r); }
     }
   };
 
- overview_render_node_t(wf::output_t *output, activities_view_t *activities,
-                         OpenGL::program_t *tex_prog,
-                         OpenGL::program_t *rounded_tex_prog,
-                         OpenGL::program_t *col_prog, GLuint wallpaper_tex,
-                         top_panel_t *panel)  // ADD panel parameter
-      : node_t(false),
-        output(output),
-        activities(activities),
-        tex_program(tex_prog),
-        rounded_tex_program(rounded_tex_prog),
-        col_program(col_prog),
-        wallpaper_texture(wallpaper_tex),
-        panel(panel) {}  // ADD initialization
+  overview_node_t(wf::output_t *out, activities_view_t *act, gl_programs_t *p, GLuint wp, top_panel_t *pnl)
+    : node_t(false), output(out), activities(act), progs(p), wallpaper_tex(wp), panel(pnl) {}
 
-  void gen_render_instances(
-      std::vector<wf::scene::render_instance_uptr> &instances,
-      wf::scene::damage_callback push_damage, wf::output_t *shown_on) override {
-    if (shown_on != output) {
-      return;
-    }
-
-    instances.push_back(
-        std::make_unique<overview_render_instance_t>(this, push_damage));
+  void gen_render_instances(std::vector<wf::scene::render_instance_uptr> &i, wf::scene::damage_callback pd, wf::output_t *on) override {
+    if (on != output) return;
+    i.push_back(std::make_unique<render_instance_t>(this, pd));
   }
 
-  wf::geometry_t get_bounding_box() override {
-    return output->get_layout_geometry();
-  }
+  wf::geometry_t get_bounding_box() override { return output->get_layout_geometry(); }
 
-  void render_texture(const wf::render_target_t &target, GLuint tex,
-                      wf::geometry_t box, float alpha = 1.0f,
-                      bool invert_y = false) {
-    auto og = output->get_layout_geometry();
-    glm::mat4 ortho =
-        glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
-
-    float x1 = box.x;
-    float x2 = box.x + box.width;
-    float y1 = box.y;
-    float y2 = box.y + box.height;
-
-    float v0 = invert_y ? 1.0f : 0.0f;
-    float v1 = invert_y ? 0.0f : 1.0f;
-
-    // Separate position and UV arrays like cube plugin does
-    GLfloat vertexData[] = {
-        x1, y1, x2, y1, x2, y2, x1, y2,
-    };
-
-    GLfloat coordData[] = {
-        0.0f, v0, 1.0f, v0, 1.0f, v1, 0.0f, v1,
-    };
-
-    tex_program->use(wf::TEXTURE_TYPE_RGBA);
-    tex_program->uniformMatrix4f("matrix", ortho);
-    tex_program->uniform1i("smp", 0);
-    tex_program->uniform1f("alpha", alpha);
-
-    GL_CALL(glActiveTexture(GL_TEXTURE0));
-    GL_CALL(glBindTexture(GL_TEXTURE_2D, tex));
-
-    // Use same signature as cube: attrib_pointer(name, size, stride, data)
-    tex_program->attrib_pointer("position", 2, 0, vertexData);
-    tex_program->attrib_pointer("uv", 2, 0, coordData);
-
-    GL_CALL(glEnable(GL_BLEND));
-    GL_CALL(glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
-    GL_CALL(glDrawArrays(GL_TRIANGLE_FAN, 0, 4));
-    GL_CALL(glDisable(GL_BLEND));
-
-    GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
-    tex_program->deactivate();
-  }
-
-  void render_solid_rect(const wf::render_target_t &target, wf::geometry_t box,
-                         glm::vec4 color) {
-    auto og = output->get_layout_geometry();
-    glm::mat4 ortho =
-        glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
-
-    float x1 = box.x;
-    float x2 = box.x + box.width;
-    float y1 = box.y;
-    float y2 = box.y + box.height;
-
-    GLfloat verts[] = {
-        x1, y1, x2, y1, x2, y2, x1, y2,
-    };
-
-    col_program->use(wf::TEXTURE_TYPE_RGBA);
-    col_program->uniformMatrix4f("matrix", ortho);
-    col_program->uniform4f("color", color);
-
-    // Use same signature as cube: attrib_pointer(name, size, stride, data)
-    col_program->attrib_pointer("position", 2, 0, verts);
-
-    GL_CALL(glEnable(GL_BLEND));
-    GL_CALL(glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA));
-    GL_CALL(glDrawArrays(GL_TRIANGLE_FAN, 0, 4));
-    GL_CALL(glDisable(GL_BLEND));
-
-    col_program->deactivate();
-  }
-
-  void render_rounded_texture(const wf::render_target_t &target, GLuint tex,
-                              wf::geometry_t box, float alpha, float radius,
-                              bool invert_y = false) {
-    auto og = output->get_layout_geometry();
-    glm::mat4 ortho =
-        glm::ortho<float>(og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
-
-    float x1 = box.x;
-    float x2 = box.x + box.width;
-    float y1 = box.y;
-    float y2 = box.y + box.height;
-
-    float v0 = invert_y ? 1.0f : 0.0f;
-    float v1 = invert_y ? 0.0f : 1.0f;
-
-    GLfloat vertexData[] = {
-        x1, y1, x2, y1, x2, y2, x1, y2,
-    };
-
-    GLfloat coordData[] = {
-        0.0f, v0, 1.0f, v0, 1.0f, v1, 0.0f, v1,
-    };
-
-    rounded_tex_program->use(wf::TEXTURE_TYPE_RGBA);
-    rounded_tex_program->uniformMatrix4f("matrix", ortho);
-    rounded_tex_program->uniform1i("smp", 0);
-    rounded_tex_program->uniform1f("alpha", alpha);
-    rounded_tex_program->uniform1f("radius", radius);
-    rounded_tex_program->uniform2f("size", (float)box.width, (float)box.height);
-
-    GL_CALL(glActiveTexture(GL_TEXTURE0));
-    GL_CALL(glBindTexture(GL_TEXTURE_2D, tex));
-
-    rounded_tex_program->attrib_pointer("position", 2, 0, vertexData);
-    rounded_tex_program->attrib_pointer("uv", 2, 0, coordData);
-
-    GL_CALL(glEnable(GL_BLEND));
-    GL_CALL(glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
-    GL_CALL(glDrawArrays(GL_TRIANGLE_FAN, 0, 4));
-    GL_CALL(glDisable(GL_BLEND));
-
-    GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
-    rounded_tex_program->deactivate();
-  }
-
-  void render_overview(const wf::scene::render_instruction_t &data,
-                       std::vector<workspace_capture_t> &workspace_captures) {
+  void do_render(const wf::scene::render_instruction_t &data, std::vector<ws_capture_t> &caps) {
     data.pass->custom_gles_subpass([&] {
       auto og = output->get_layout_geometry();
-      float alpha = activities->get_background_alpha();
+      glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
 
-      if (alpha < 0.01f) {
-        return;
+      int aws = activities->get_animating_ws();
+      float cr = activities->corner_radius;
+
+      // Wallpaper + overlay
+      if (wallpaper_tex) {
+        wf::geometry_t bg = {og.x, og.y, og.width, og.height};
+        render_tex(progs->tex, output, wallpaper_tex, bg, 1.0f, true);
+        render_rect(progs->col, output, bg, {0, 0, 0, 0.5f});
       }
 
-      // Clear first
-      GL_CALL(glClearColor(0.0f, 0.0f, 0.0f, 1.0f));
-      GL_CALL(glClear(GL_COLOR_BUFFER_BIT));
-
-      float corner_r = activities->corner_radius;
-      int animating_ws_idx = activities->get_animating_workspace_index();
-
-      // Draw wallpaper as background
-      if (wallpaper_texture != 0) {
-        wf::geometry_t bg_geo = {og.x, og.y, og.width, og.height};
-        render_texture(data.target, wallpaper_texture, bg_geo, 1.0f, true);
-
-        // Draw dark semi-transparent overlay
-        render_solid_rect(data.target, bg_geo,
-                          glm::vec4(0.0f, 0.0f, 0.0f, 0.5f));
+      // Workspace thumbnails
+      auto &wsg = activities->ws_geos;
+      for (size_t i = 0; i < wsg.size() && i < caps.size(); i++) {
+        wf::geometry_t g = {og.x + wsg[i].x, og.y + wsg[i].y, wsg[i].width, wsg[i].height};
+        float a = ((int)i == aws) ? 1.0f : 0.7f;
+        auto t = wf::gles_texture_t::from_aux(caps[i].fb);
+        render_rounded(progs->rounded, output, t.tex_id, g, a, cr * 0.5f, true);
       }
 
-      // Draw ALL small workspace thumbnails at BOTTOM (including current)
-      auto &ws_geometries = activities->get_workspace_geometries();
-      for (size_t i = 0;
-           i < ws_geometries.size() && i < workspace_captures.size(); i++) {
-        wf::geometry_t ws_geo = ws_geometries[i];
-        ws_geo.x += og.x;
-        ws_geo.y += og.y;
-
-        // Current workspace thumbnail is slightly brighter
-        float thumb_alpha = ((int)i == animating_ws_idx) ? 1.0f : 0.7f;
-
-        auto tex =
-            wf::gles_texture_t::from_aux(workspace_captures[i].framebuffer);
-        render_rounded_texture(data.target, tex.tex_id, ws_geo, thumb_alpha,
-                               corner_r * 0.5f, true);
+      // Main desktop preview
+      auto dg = activities->desktop_anim.current();
+      dg.x += og.x; dg.y += og.y;
+      if (dg.width > 0 && dg.height > 0 && aws >= 0 && aws < (int)caps.size()) {
+        float sf = (float)dg.width / og.width;
+        float rad = std::clamp(cr * 2.0f * (1.0f - sf), 0.0f, cr * 2.0f);
+        auto t = wf::gles_texture_t::from_aux(caps[aws].fb);
+        if (rad > 1) render_rounded(progs->rounded, output, t.tex_id, dg, 1.0f, rad, true);
+        else render_tex(progs->tex, output, t.tex_id, dg, 1.0f, true);
       }
 
-      // Draw the large main desktop preview ABOVE the thumbnails
-      auto desktop_geo = activities->get_current_desktop_geometry();
-      desktop_geo.x += og.x;
-      desktop_geo.y += og.y;
-
-      if ((desktop_geo.width > 0) && (desktop_geo.height > 0) &&
-          (animating_ws_idx >= 0) &&
-          (animating_ws_idx < (int)workspace_captures.size())) {
-        // Calculate corner radius that scales with the animation
-        // Use larger base radius for more curved corners
-        float large_corner_r = corner_r * 2.0f;
-        float scale_factor = (float)desktop_geo.width / og.width;
-        float current_radius = large_corner_r * (1.0f - scale_factor);
-        current_radius =
-            std::max(0.0f, std::min(current_radius, large_corner_r));
-
-        auto tex = wf::gles_texture_t::from_aux(
-            workspace_captures[animating_ws_idx].framebuffer);
-        if (current_radius > 1.0f) {
-          render_rounded_texture(data.target, tex.tex_id, desktop_geo, 1.0f,
-                                 current_radius, true);
-        } else {
-          render_texture(data.target, tex.tex_id, desktop_geo, 1.0f, true);
-        }
+      // Panel
+      if (panel && panel->tex_id) {
+        render_tex(progs->tex, output, panel->tex_id, panel->get_render_geometry(), 1.0f, true);
       }
-
-if (panel && panel->get_texture()) {
-    wf::geometry_t panel_geom = panel->get_panel_geometry();
-    render_texture(data.target, panel->get_texture(), panel_geom, 1.0f, true);
-}
-
-
     });
   }
-
-     
-
 };
 
-// Panel render node - only renders when its region is damaged
-class panel_render_node_t : public wf::scene::node_t
-{
-  public:
-    top_panel_t *panel;
-    wf::output_t *output;
-    OpenGL::program_t *tex_program;
-    bool *overview_active = nullptr;
-
-    class panel_render_instance_t : public wf::scene::render_instance_t
-    {
-        panel_render_node_t *self;
-        wf::scene::damage_callback push_damage;
-
-      public:
-        panel_render_instance_t(panel_render_node_t *self,
-            wf::scene::damage_callback push_damage)
-            : self(self), push_damage(push_damage)
-        {}
-
-void schedule_instructions(
-    std::vector<wf::scene::render_instruction_t>& instructions,
-    const wf::render_target_t& target, wf::region_t& damage) override
-{
-    // Skip if overview is handling panel rendering
-    if (self->overview_active && *self->overview_active) {
-        return;
-    }
-
-    auto bbox = self->get_bounding_box();
-    wf::region_t our_damage = damage & bbox;
-    
-    if (!our_damage.empty())
-    {
-        instructions.push_back(wf::scene::render_instruction_t{
-            .instance = this,
-            .target   = target,
-            .damage   = our_damage,
-        });
-    }
-}
-        void render(const wf::scene::render_instruction_t& data) override
-        {
-            self->render_panel(data.target);
-        }
-
-        void compute_visibility(wf::output_t*, wf::region_t&) override {}
-    };
-
-panel_render_node_t(wf::output_t *output, top_panel_t *panel, 
-                        OpenGL::program_t *tex_prog, bool *overview_active)
-        : node_t(false), output(output), panel(panel), tex_program(tex_prog),
-          overview_active(overview_active) {}
-
-    void gen_render_instances(
-        std::vector<wf::scene::render_instance_uptr>& instances,
-        wf::scene::damage_callback push_damage, wf::output_t *shown_on) override
-    {
-        if (shown_on != output)
-        {
-            return;
-        }
-        instances.push_back(std::make_unique<panel_render_instance_t>(this, push_damage));
-    }
-
-    wf::geometry_t get_bounding_box() override
-    {
-        return panel->get_panel_geometry();
-    }
-
-    void render_panel(const wf::render_target_t& target)
-    {
-            static int render_count = 0;
-    render_count++;
-    if (render_count % 100 == 1) {  // Log every 100th render
-        LOGI("Panel render #", render_count);
-    }
-        auto og = output->get_layout_geometry();
-        GLuint panel_tex = panel->get_texture();
-        if (!panel_tex)
-        {
-            return;
-        }
-
-        glm::mat4 ortho = glm::ortho<float>(
-            og.x, og.x + og.width, og.y + og.height, og.y, -1, 1);
-
-        wf::geometry_t panel_geom = panel->get_panel_geometry();
-
-        float x1 = panel_geom.x;
-        float x2 = panel_geom.x + panel_geom.width;
-        float y1 = panel_geom.y;
-        float y2 = panel_geom.y + panel_geom.height;
-
-        GLfloat vertexData[] = { x1, y1, x2, y1, x2, y2, x1, y2 };
-        GLfloat coordData[] = { 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f };
-
-        tex_program->use(wf::TEXTURE_TYPE_RGBA);
-        tex_program->uniformMatrix4f("matrix", ortho);
-        tex_program->uniform1i("smp", 0);
-        tex_program->uniform1f("alpha", 1.0f);
-
-        GL_CALL(glActiveTexture(GL_TEXTURE0));
-        GL_CALL(glBindTexture(GL_TEXTURE_2D, panel_tex));
-
-        tex_program->attrib_pointer("position", 2, 0, vertexData);
-        tex_program->attrib_pointer("uv", 2, 0, coordData);
-
-        GL_CALL(glEnable(GL_BLEND));
-        GL_CALL(glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
-        GL_CALL(glDrawArrays(GL_TRIANGLE_FAN, 0, 4));
-        GL_CALL(glDisable(GL_BLEND));
-
-        GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
-        tex_program->deactivate();
-    }
-};
 // ============================================================================
-// Per-output Instance - Fixed version
+// Per-Output Instance
 // ============================================================================
 
 class overview_output_t : public wf::per_output_plugin_instance_t {
- public:
+public:
   std::unique_ptr<top_panel_t> panel;
   std::unique_ptr<activities_view_t> activities;
-  std::shared_ptr<overview_render_node_t> render_node;
-  std::shared_ptr<panel_render_node_t> panel_node;  // NEW: panel scene node
-
+  std::shared_ptr<overview_node_t> render_node;
+  std::shared_ptr<panel_node_t> panel_node;
+  gl_programs_t progs;
+  GLuint wallpaper_tex = 0;
+  std::string wallpaper_path;
   wf::activator_callback toggle_cb;
   wf::wl_timer<false> clock_timer;
   wf::effect_hook_t pre_hook;
-  // REMOVED: wf::effect_hook_t post_hook;
-
-  OpenGL::program_t tex_program;
-  OpenGL::program_t rounded_tex_program;
-  OpenGL::program_t col_program;
-  bool programs_loaded = false;
-
-  GLuint wallpaper_texture = 0;
-  int wallpaper_width = 0;
-  int wallpaper_height = 0;
-  std::string wallpaper_path =
-      "/home/light/Pictures/wallpapers/Dynamic-Wallpapers/Light/"
-      "Beach_light.png";
-
-  int panel_height = 16;
-  std::string panel_color = "#1a1a1aE6";
-  int corner_radius = 12;
-  int animation_duration = 300;
-  double overview_scale = 0.85;
-  int spacing = 20;
-
-  // Track if hooks are currently active
   bool hooks_active = false;
+  int panel_height = 16, corner_radius = 12, spacing = 20, anim_duration = 300;
+  std::string panel_color = "#1a1a1aE6";
 
   void load_wallpaper() {
-    cairo_surface_t *img =
-        cairo_image_surface_create_from_png(wallpaper_path.c_str());
-    if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) {
-      LOGE("Failed to load wallpaper from: ", wallpaper_path);
-      cairo_surface_destroy(img);
-      return;
-    }
-
-    wallpaper_width = cairo_image_surface_get_width(img);
-    wallpaper_height = cairo_image_surface_get_height(img);
-    unsigned char *data = cairo_image_surface_get_data(img);
-
+    if (wallpaper_path.empty()) return;
+    auto img = cairo_image_surface_create_from_png(wallpaper_path.c_str());
+    if (cairo_surface_status(img) != CAIRO_STATUS_SUCCESS) { cairo_surface_destroy(img); return; }
+    int w = cairo_image_surface_get_width(img), h = cairo_image_surface_get_height(img);
+    auto data = cairo_image_surface_get_data(img);
     wf::gles::run_in_context([&] {
-      if (wallpaper_texture == 0) {
-        GL_CALL(glGenTextures(1, &wallpaper_texture));
-      }
-
-      GL_CALL(glBindTexture(GL_TEXTURE_2D, wallpaper_texture));
-      GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR));
-      GL_CALL(glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR));
-      GL_CALL(
-          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE));
-      GL_CALL(
-          glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE));
-      GL_CALL(glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, wallpaper_width,
-                           wallpaper_height, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE,
-                           data));
-      GL_CALL(glBindTexture(GL_TEXTURE_2D, 0));
+      if (!wallpaper_tex) glGenTextures(1, &wallpaper_tex);
+      glBindTexture(GL_TEXTURE_2D, wallpaper_tex);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, data);
+      glBindTexture(GL_TEXTURE_2D, 0);
     });
-
     cairo_surface_destroy(img);
-    LOGI("Loaded wallpaper: ", wallpaper_width, "x", wallpaper_height);
   }
 
   void init() override {
     panel = std::make_unique<top_panel_t>(output, panel_height, panel_color);
     activities = std::make_unique<activities_view_t>(output);
-    activities->set_config(corner_radius, overview_scale, spacing, panel_height,
-                           animation_duration);
-
-    wf::gles::run_in_context([&] { load_programs(); });
+    activities->set_config(corner_radius, spacing, panel_height, anim_duration);
+    wf::gles::run_in_context([&] { progs.load(); });
     load_wallpaper();
 
-    // PRE hook - only for animation management (added dynamically)
     pre_hook = [this]() {
-      // Tick animations and check if still animating
-      bool was_animating = activities->currently_animating();
-      activities->tick_animations();
-      bool still_animating = activities->currently_animating();
-
-      // Only damage and schedule redraw if actually animating
-      if (still_animating) {
-        if (render_node) {
-          wf::scene::damage_node(render_node, render_node->get_bounding_box());
-        }
+      bool was = activities->is_animating;
+      activities->tick();
+      bool still = activities->is_animating;
+      if (still) {
+        if (render_node) wf::scene::damage_node(render_node, render_node->get_bounding_box());
         output->render->schedule_redraw();
-      } else if (was_animating && !still_animating) {
-        // Animation just finished - do one final damage
-        if (render_node) {
-          wf::scene::damage_node(render_node, render_node->get_bounding_box());
-        }
-
-        // Check if we're closing
-        if (!activities->is_active) {
-          deactivate_hooks();
-        }
+      } else if (was && !still && !activities->is_active) {
+        if (render_node) wf::scene::damage_node(render_node, render_node->get_bounding_box());
+        deactivate_hooks();
       }
     };
 
-// Create panel scene node (renders only when damaged)
-    panel_node = std::make_shared<panel_render_node_t>(
-        output, panel.get(), &tex_program, &activities->is_active);
-    wf::scene::add_front(wf::get_core().scene(), panel_node);
-
-    // Clock update timer - damage panel node
-    clock_timer.set_timeout(60000, [this]() {
-      if (panel->update_clock()) {
-        wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
-      }
-      return true;
+    clock_timer.set_timeout(60000, [this]() { 
+      panel->render(); panel->upload(); 
+      wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
+      return true; 
     });
-
-    // Initial damage for panel
-    wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
-
-    LOGI("Wayfire Overview output initialized");
-  }
-
-  // Activate hooks when overview opens
-void activate_hooks() {
-  if (hooks_active) {
-    return;
-  }
-
-  // Add render node
-  if (!render_node) {
-    render_node = std::make_shared<overview_render_node_t>(
-        output, activities.get(), &tex_program, &rounded_tex_program,
-        &col_program, wallpaper_texture, panel.get());  // ADD panel.get()
-    wf::scene::add_front(wf::get_core().scene(), render_node);
-  }
-
-  // Re-add panel node to front so it renders on top of overview
-  if (panel_node) {
-    wf::scene::remove_child(panel_node);
+    
+    // Create panel scene node
+    panel_node = std::make_shared<panel_node_t>(output, panel.get(), &progs, &activities->is_active);
     wf::scene::add_front(wf::get_core().scene(), panel_node);
+    wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
   }
 
-  // Add pre_hook for animation
-  output->render->add_effect(&pre_hook, wf::OUTPUT_EFFECT_PRE);
-  hooks_active = true;
-
-  LOGI("Overview hooks activated");
-}
-
-  // Deactivate hooks when overview closes
-  void deactivate_hooks() {
-    if (!hooks_active) {
-      return;
+  void activate_hooks() {
+    if (hooks_active) return;
+    if (!render_node) {
+      render_node = std::make_shared<overview_node_t>(output, activities.get(), &progs, wallpaper_tex, panel.get());
+      wf::scene::add_front(wf::get_core().scene(), render_node);
     }
+    // Re-add panel node to front so it's above overview
+    if (panel_node) {
+      wf::scene::remove_child(panel_node);
+      wf::scene::add_front(wf::get_core().scene(), panel_node);
+    }
+    output->render->add_effect(&pre_hook, wf::OUTPUT_EFFECT_PRE);
+    hooks_active = true;
+  }
 
-    // Remove pre_hook
+  void deactivate_hooks() {
+    if (!hooks_active) return;
     output->render->rem_effect(&pre_hook);
     hooks_active = false;
-
-    // Remove render node
-    if (render_node) {
-      wf::scene::remove_child(render_node);
-      render_node = nullptr;
-    }
-
-    LOGI("Overview hooks deactivated");
+    if (render_node) { wf::scene::remove_child(render_node); render_node = nullptr; }
   }
 
-  // Called when toggle is triggered
-  void toggle_overview() {
+  void toggle() {
     activities->toggle();
-
-    if (activities->is_active) {
-      // Entering overview
-      activate_hooks();
-    }
-    // Note: deactivate_hooks() is called from pre_hook when animation finishes
-
+    if (activities->is_active) activate_hooks();
     output->render->damage_whole();
   }
 
-  void load_programs() {
-    if (programs_loaded) {
-      return;
-    }
-
-    programs_loaded = true;
-
-    const char *tex_vert_src =
-        "#version 100\n"
-        "attribute mediump vec2 position;\n"
-        "attribute mediump vec2 uv;\n"
-        "varying mediump vec2 uvpos;\n"
-        "uniform mat4 matrix;\n"
-        "void main() {\n"
-        "   gl_Position = matrix * vec4(position, 0.0, 1.0);\n"
-        "   uvpos = uv;\n"
-        "}\n";
-
-    const char *tex_frag_src =
-        "#version 100\n"
-        "precision mediump float;\n"
-        "varying mediump vec2 uvpos;\n"
-        "uniform sampler2D smp;\n"
-        "uniform float alpha;\n"
-        "void main() {\n"
-        "   vec4 c = texture2D(smp, uvpos);\n"
-        "   gl_FragColor = vec4(c.rgb * alpha, c.a * alpha);\n"
-        "}\n";
-
-    tex_program.compile(tex_vert_src, tex_frag_src);
-
-    const char *rounded_tex_vert_src =
-        "#version 100\n"
-        "precision mediump float;\n"
-        "attribute vec2 position;\n"
-        "attribute vec2 uv;\n"
-        "varying vec2 uvpos;\n"
-        "varying vec2 fragCoord;\n"
-        "uniform mat4 matrix;\n"
-        "uniform vec2 size;\n"
-        "void main() {\n"
-        "   gl_Position = matrix * vec4(position, 0.0, 1.0);\n"
-        "   uvpos = uv;\n"
-        "   fragCoord = uv * size;\n"
-        "}\n";
-
-    const char *rounded_tex_frag_src =
-        "#version 100\n"
-        "precision mediump float;\n"
-        "varying vec2 uvpos;\n"
-        "varying vec2 fragCoord;\n"
-        "uniform sampler2D smp;\n"
-        "uniform float alpha;\n"
-        "uniform float radius;\n"
-        "uniform vec2 size;\n"
-        "void main() {\n"
-        "   vec4 c = texture2D(smp, uvpos);\n"
-        "   vec2 pos = fragCoord;\n"
-        "   vec2 cornerDist;\n"
-        "   if (pos.x < radius && pos.y < radius) {\n"
-        "       cornerDist = pos - vec2(radius, radius);\n"
-        "   } else if (pos.x > size.x - radius && pos.y < radius) {\n"
-        "       cornerDist = pos - vec2(size.x - radius, radius);\n"
-        "   } else if (pos.x < radius && pos.y > size.y - radius) {\n"
-        "       cornerDist = pos - vec2(radius, size.y - radius);\n"
-        "   } else if (pos.x > size.x - radius && pos.y > size.y - radius) {\n"
-        "       cornerDist = pos - vec2(size.x - radius, size.y - radius);\n"
-        "   } else {\n"
-        "       gl_FragColor = vec4(c.rgb * alpha, c.a * alpha);\n"
-        "       return;\n"
-        "   }\n"
-        "   float dist = length(cornerDist);\n"
-        "   float aa = smoothstep(radius, radius - 1.5, dist);\n"
-        "   gl_FragColor = vec4(c.rgb * alpha * aa, c.a * alpha * aa);\n"
-        "}\n";
-
-    rounded_tex_program.compile(rounded_tex_vert_src, rounded_tex_frag_src);
-
-    const char *col_vert_src =
-        "#version 100\n"
-        "attribute mediump vec2 position;\n"
-        "uniform mat4 matrix;\n"
-        "void main() {\n"
-        "   gl_Position = matrix * vec4(position, 0.0, 1.0);\n"
-        "}\n";
-
-    const char *col_frag_src =
-        "#version 100\n"
-        "precision mediump float;\n"
-        "uniform vec4 color;\n"
-        "void main() {\n"
-        "   gl_FragColor = color;\n"
-        "}\n";
-
-    col_program.compile(col_vert_src, col_frag_src);
-  }
-
   void fini() override {
-    // Remove hooks if active
-    if (hooks_active) {
-      output->render->rem_effect(&pre_hook);
-      hooks_active = false;
-    }
-
-    if (render_node) {
-      wf::scene::remove_child(render_node);
-      render_node = nullptr;
-    }
-
-    // Remove panel node
-    if (panel_node) {
-      wf::scene::remove_child(panel_node);
-      panel_node = nullptr;
-    }
-
+    if (hooks_active) { output->render->rem_effect(&pre_hook); hooks_active = false; }
+    if (render_node) { wf::scene::remove_child(render_node); render_node = nullptr; }
+    if (panel_node) { wf::scene::remove_child(panel_node); panel_node = nullptr; }
     clock_timer.disconnect();
-
     wf::gles::run_in_context_if_gles([&] {
-      tex_program.free_resources();
-      rounded_tex_program.free_resources();
-      col_program.free_resources();
-      if (wallpaper_texture) {
-        glDeleteTextures(1, &wallpaper_texture);
-        wallpaper_texture = 0;
-      }
+      progs.free();
+      if (wallpaper_tex) { glDeleteTextures(1, &wallpaper_tex); wallpaper_tex = 0; }
     });
-
-    activities.reset();
-    panel.reset();
+    activities.reset(); panel.reset();
   }
 
   void handle_motion(wf::pointf_t cursor) {
     auto og = output->get_layout_geometry();
-
-    // Only check panel hover if cursor is in panel region
-    bool in_panel_area =
-        (cursor.y >= og.y && cursor.y < og.y + panel->panel_height);
-
-    if (in_panel_area) {
-      if (panel->set_hover(panel->point_in_activities(cursor))) {
-        wf::scene::damage_node(panel_node, panel->get_activities_geometry());
-      }
+    bool in_panel = cursor.y >= og.y && cursor.y < og.y + panel->height;
+    if (in_panel) {
+      if (panel->set_hover(panel->point_in_activities(cursor)))
+        wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
     } else if (panel->activities_hovered) {
-      // Cursor left panel area, clear hover
-      if (panel->set_hover(false)) {
-        wf::scene::damage_node(panel_node, panel->get_activities_geometry());
-      }
+      if (panel->set_hover(false)) 
+        wf::scene::damage_node(panel_node, panel_node->get_bounding_box());
     }
-
-    // Handle overview hover
-    if (activities->is_active && !activities->currently_animating()) {
-      auto old_hovered = activities->hovered_view;
-
-      // Convert to local coordinates for hover detection
-      wf::pointf_t local_cursor = {cursor.x - og.x, cursor.y - og.y};
-      activities->update_hover(local_cursor);
-
-      if (old_hovered != activities->hovered_view) {
-        if (render_node) {
-          wf::scene::damage_node(render_node,
-              activities->get_screen_preview_geometry_output());
-        }
-      }
+    if (activities->is_active && !activities->is_animating) {
+      auto old = activities->hovered_view;
+      activities->update_hover({cursor.x - og.x, cursor.y - og.y});
+      if (old != activities->hovered_view && render_node)
+        wf::scene::damage_node(render_node, activities->get_preview_geo_output());
     }
   }
 
-  bool handle_button(uint32_t button, uint32_t state, wf::pointf_t cursor) {
-    if ((button != BTN_LEFT) || (state != WL_POINTER_BUTTON_STATE_PRESSED)) {
-      return false;
+  bool handle_button(uint32_t btn, uint32_t state, wf::pointf_t cursor) {
+    if (btn != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return false;
+    if (panel->point_in_activities(cursor)) { toggle(); return true; }
+    if (activities->is_active && !activities->is_animating) {
+      if (activities->handle_click(cursor)) { output->render->damage_whole(); return true; }
     }
-
-    if (panel->point_in_activities(cursor)) {
-      toggle_overview();
-      return true;
-    }
-
-    if (activities->is_active && !activities->currently_animating()) {
-      bool handled = activities->handle_click(cursor);
-      if (handled) {
-        output->render->damage_whole();
-      }
-      return handled;
-    }
-
     return false;
   }
 };
@@ -1911,114 +864,69 @@ void activate_hooks() {
 // ============================================================================
 
 class wayfire_overview_t : public wf::plugin_interface_t {
- public:
   wf::option_wrapper_t<int> opt_panel_height{"overview/panel_height"};
   wf::option_wrapper_t<std::string> opt_panel_color{"overview/panel_color"};
   wf::option_wrapper_t<int> opt_corner_radius{"overview/corner_radius"};
-  wf::option_wrapper_t<int> opt_animation_duration{
-      "overview/animation_duration"};
-  wf::option_wrapper_t<double> opt_overview_scale{"overview/overview_scale"};
+  wf::option_wrapper_t<int> opt_animation_duration{"overview/animation_duration"};
   wf::option_wrapper_t<int> opt_spacing{"overview/spacing"};
   wf::option_wrapper_t<wf::activatorbinding_t> opt_toggle{"overview/toggle"};
   wf::option_wrapper_t<std::string> opt_wallpaper{"overview/wallpaper"};
 
-  std::map<wf::output_t *, std::unique_ptr<overview_output_t>> outputs;
+  std::map<wf::output_t*, std::unique_ptr<overview_output_t>> outputs;
 
-  wf::signal::connection_t<wf::output_added_signal> on_output_added =
-      [this](wf::output_added_signal *ev) { add_output(ev->output); };
-  wf::signal::connection_t<wf::output_removed_signal> on_output_removed =
-      [this](wf::output_removed_signal *ev) { remove_output(ev->output); };
-  wf::signal::connection_t<
-      wf::post_input_event_signal<wlr_pointer_motion_event>>
-      on_motion =
-          [this](wf::post_input_event_signal<wlr_pointer_motion_event> *) {
-            handle_motion();
-          };
-  wf::signal::connection_t<
-      wf::post_input_event_signal<wlr_pointer_button_event>>
-      on_button =
-          [this](wf::post_input_event_signal<wlr_pointer_button_event> *ev) {
-            handle_button(ev->event);
-          };
+  wf::signal::connection_t<wf::output_added_signal> on_output_added = [this](wf::output_added_signal *ev) { add_output(ev->output); };
+  wf::signal::connection_t<wf::output_removed_signal> on_output_removed = [this](wf::output_removed_signal *ev) { remove_output(ev->output); };
+  wf::signal::connection_t<wf::post_input_event_signal<wlr_pointer_motion_event>> on_motion = [this](auto*) { handle_motion(); };
+  wf::signal::connection_t<wf::post_input_event_signal<wlr_pointer_button_event>> on_button = [this](auto *ev) { handle_button(ev->event); };
 
+public:
   void init() override {
     wf::get_core().connect(&on_output_added);
     wf::get_core().connect(&on_output_removed);
     wf::get_core().connect(&on_motion);
     wf::get_core().connect(&on_button);
-
-    for (auto &output : wf::get_core().output_layout->get_outputs()) {
-      add_output(output);
-    }
-
-    LOGI("Wayfire Overview plugin initialized");
+    for (auto &o : wf::get_core().output_layout->get_outputs()) add_output(o);
   }
 
   void fini() override {
-    for (auto &[out, inst] : outputs) {
-      out->rem_binding(&inst->toggle_cb);
-      inst->fini();
-    }
-
+    for (auto &[o, i] : outputs) { o->rem_binding(&i->toggle_cb); i->fini(); }
     outputs.clear();
-    LOGI("Wayfire Overview plugin finalized");
   }
 
-  void add_output(wf::output_t *output) {
-    auto inst = std::make_unique<overview_output_t>();
-    inst->panel_height = opt_panel_height;
-    inst->panel_color = (std::string)opt_panel_color;
-    inst->corner_radius = opt_corner_radius;
-    inst->animation_duration = opt_animation_duration;
-    inst->overview_scale = opt_overview_scale;
-    inst->spacing = opt_spacing;
-    inst->output = output;
-
-    std::string wp = (std::string)opt_wallpaper;
-    if (!wp.empty()) {
-      inst->wallpaper_path = wp;
-    }
-
-    inst->init();
-
-    auto *ptr = inst.get();
-    inst->toggle_cb = [ptr](auto) {
-      ptr->toggle_overview();  // Use the new method
-      return true;
-    };
-    output->add_activator(opt_toggle, &inst->toggle_cb);
-
-    outputs[output] = std::move(inst);
+  void add_output(wf::output_t *out) {
+    auto i = std::make_unique<overview_output_t>();
+    i->panel_height = opt_panel_height;
+    i->panel_color = (std::string)opt_panel_color;
+    i->corner_radius = opt_corner_radius;
+    i->anim_duration = opt_animation_duration;
+    i->spacing = opt_spacing;
+    i->output = out;
+    i->wallpaper_path = (std::string)opt_wallpaper;
+    i->init();
+    auto *p = i.get();
+    i->toggle_cb = [p](auto) { p->toggle(); return true; };
+    out->add_activator(opt_toggle, &i->toggle_cb);
+    outputs[out] = std::move(i);
   }
 
-  void remove_output(wf::output_t *output) {
-    if (outputs.count(output)) {
-      output->rem_binding(&outputs[output]->toggle_cb);
-      outputs[output]->fini();
-      outputs.erase(output);
-    }
+  void remove_output(wf::output_t *out) {
+    if (outputs.count(out)) { out->rem_binding(&outputs[out]->toggle_cb); outputs[out]->fini(); outputs.erase(out); }
   }
 
-  // In wayfire_overview_t - this is the CORRECT version
   void handle_motion() {
-    auto cursor = wf::get_core().get_cursor_position();
-    auto output =
-        wf::get_core().output_layout->get_output_at(cursor.x, cursor.y);
-    if (output && outputs.count(output)) {
-      outputs[output]->handle_motion(cursor);
-    }
+    auto c = wf::get_core().get_cursor_position();
+    auto o = wf::get_core().output_layout->get_output_at(c.x, c.y);
+    if (o && outputs.count(o)) outputs[o]->handle_motion(c);
   }
 
-  void handle_button(wlr_pointer_button_event *event) {
-    auto cursor = wf::get_core().get_cursor_position();
-    auto output =
-        wf::get_core().output_layout->get_output_at(cursor.x, cursor.y);
-    if (output && outputs.count(output)) {
-      outputs[output]->handle_button(event->button, event->state, cursor);
-    }
+  void handle_button(wlr_pointer_button_event *ev) {
+    auto c = wf::get_core().get_cursor_position();
+    auto o = wf::get_core().output_layout->get_output_at(c.x, c.y);
+    if (o && outputs.count(o)) outputs[o]->handle_button(ev->button, ev->state, c);
   }
 };
-}  // namespace overview
-}  // namespace wf
+
+} // namespace overview
+} // namespace wf
 
 DECLARE_WAYFIRE_PLUGIN(wf::overview::wayfire_overview_t);
